@@ -19,13 +19,46 @@ Codex CLI authentication is tied to the active `CODEX_HOME`. This tool gives you
 ```bash
 git clone git@github.com:Gravel7/codex-account-manager.git
 cd codex-account-manager
-chmod +x bin/codex-account
 ```
 
-Optional: add to PATH in `~/.zshrc`:
+Option A (user-level, no `sudo`):
 
 ```bash
-export PATH="$PATH:$HOME/path/to/codex-account-manager/bin"
+mkdir -p ~/.local/bin
+install -m 755 ./bin/codex-account ~/.local/bin/codex-account
+```
+
+Add to `~/.zshrc`:
+
+```zsh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Option B (global, with `sudo`):
+
+```bash
+sudo install -m 755 ./bin/codex-account /usr/local/bin/codex-account
+```
+
+Apply and verify:
+
+```bash
+source ~/.zshrc
+rehash
+which codex-account
+codex-account --help
+```
+
+If `command not found` after Option B, ensure `/usr/local/bin` is in PATH:
+
+```zsh
+echo $PATH | tr ':' '\n' | grep -x /usr/local/bin
+```
+
+If missing, add this to `~/.zshrc`:
+
+```zsh
+export PATH="/usr/local/bin:$PATH"
 ```
 
 ## Usage
@@ -38,24 +71,16 @@ codex-account current
 codex-account run -- --help
 ```
 
-## zsh Convenience Function
+## zsh Notes
 
-Add to `~/.zshrc`:
+- `cx switch work` sets the selected account in state.
+- The actual runtime account is determined by `CODEX_HOME` used when `codex` starts.
+- Optional convenience wrappers:
 
 ```zsh
-cx() {
-  command codex-account "$@"
-}
-
-codex() {
-  command codex-account run -- "$@"
-}
+cx() { command codex-account "$@"; }
+codex() { command codex-account run -- "$@"; }
 ```
-
-After this:
-
-- `cx switch work`
-- `codex` always runs under the currently selected account
 
 ## Environment Variables
 
