@@ -73,13 +73,21 @@ codex-account run -- --help
 
 ## zsh Notes
 
-- `cx switch work` sets the selected account in state.
-- The actual runtime account is determined by `CODEX_HOME` used when `codex` starts.
-- Optional convenience wrappers:
+- Recommended wrapper (do not override `codex`):
 
 ```zsh
 cx() { command codex-account "$@"; }
-codex() { command codex-account run -- "$@"; }
+```
+
+- Keep native `codex` unchanged. Do not define `codex() { ... }`.
+- `cx switch work` sets the selected account in state.
+- Runtime account is determined by `CODEX_HOME` used when `codex` starts.
+- If you previously defined a `codex()` function, remove it and reload shell:
+
+```zsh
+unset -f codex 2>/dev/null
+source ~/.zshrc
+rehash
 ```
 
 ## Environment Variables
