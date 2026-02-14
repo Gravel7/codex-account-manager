@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACCOUNT_ROOT="${CODEX_ACCOUNT_ROOT:-$HOME}"
+STATE_ROOT="${CODEX_ACCOUNT_STATE_ROOT:-${HOME}/.codex-account-manager}"
+STATE_FILE="${STATE_ROOT}/state"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  codex-account init [name] [--from-current-config]
+  codex-account list
+  codex-account current
+  codex-account switch <name>
+  codex-account login [name]
+  codex-account logout [name]
+  codex-account run [--account <name>] [--] [codex_args...]
+  codex-account exec [--account <name>] [--] <codex_subcommand_and_args...>
+
+Conventions:
+  - account name "default" -> ~/.codex
+  - other names -> ~/.codex-<name>
+  - override root via CODEX_ACCOUNT_ROOT (default: $HOME)
+  - override state via CODEX_ACCOUNT_STATE_ROOT (default: ~/.codex-account-manager)
+
+Examples:
+  codex-account init work --from-current-config
+  codex-account login work
+  codex-account switch work
+  codex-account current
+  codex-account run
+  codex-account exec -- review
+USAGE
+}
+
+account_home() {
+  local name="${1:-default}"
+  if [[ "$name" == "default" ]]; then
+    printf '%s/.codex\n' "$ACCOUNT_ROOT"
+  else
+    printf '%s/.codex-%s\n' "$ACCOUNT_ROOT" "$name"
+  fi
+}
+
+get_current_name() {
+  if [[ -n "${CODEX_ACCOUNT:-}" ]]; then
+    printf '%s\n' "$CODEX_ACCOUNT"
+    return
+  fi
+
+  if [[ -f "$STATE_FILE" ]]; then
+    local n
+    n="$(sed -n 's/^current=//p' "$STATE_FILE" | tail -n 1)"
+    if [[ -n "$n" ]]; then
+      printf '%s\n' "$n"
+      return
+    fi
+  fi
+
+  printf 'default\n'
+}
+
+set_current_name() {
+  local name="$1"
+  mkdir -p "$STATE_ROOT"
+  printf 'current=%s\n' "$name" > "$STATE_FILE"
+}
+
+json_extract() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+}
+
+b64url_decode() {
+  local in="$1"
+  local rem=$(( ${#in} % 4 ))
+  if [[ $rem -eq 2 ]]; then
+    in+="=="
+  elif [[ $rem -eq 3 ]]; then
+    in+="="
+  elif [[ $rem -eq 1 ]]; then
+    in+="==="
+  fi
+  in="$(printf '%s' "$in" | tr '_-' '/+')"
+
+  if command -v base64 >/dev/null 2>&1; then
+    if printf '%s' "$in" | base64 --decode >/dev/null 2>&1; then
+      printf '%s' "$in" | base64 --decode 2>/dev/null
+      return
+    fi
+    if printf '%s' "$in" | base64 -D >/dev/null 2>&1; then
+      printf '%s' "$in" | base64 -D 2>/dev/null
+      return
+    fi
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$in" | openssl base64 -d -A 2>/dev/null
+    return
+  fi
+
+  return 1
+}
+
+jwt_payload() {
+  local jwt="$1"
+  local payload
+  payload="$(printf '%s' "$jwt" | cut -d'.' -f2)"
+  [[ -n "$payload" ]] || return 1
+  b64url_decode "$payload"
+}
+
+auth_summary() {
+  local home="$1"
+  local auth="$home/auth.json"
+
+  if [[ ! -f "$auth" ]]; then
+    printf 'status=not_logged_in\n'
+    return
+  fi
+
+  local auth_mode account_id access_token payload email
+  auth_mode="$(json_extract "$auth" "auth_mode")"
+  account_id="$(json_extract "$auth" "account_id")"
+  access_token="$(json_extract "$auth" "access_token")"
+
+  email=""
+  if [[ -n "$access_token" ]]; then
+    payload="$(jwt_payload "$access_token" 2>/dev/null || true)"
+    if [[ -n "$payload" ]]; then
+      email="$(printf '%s' "$payload" | sed -n 's/.*"email"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    fi
+  fi
+
+  printf 'status=logged_in\n'
+  printf 'auth_mode=%s\n' "${auth_mode:-unknown}"
+  printf 'account_id=%s\n' "${account_id:-unknown}"
+  printf 'email=%s\n' "${email:-unknown}"
+}
+
+print_account_line() {
+  local name="$1"
+  local home="$2"
+  local marker="$3"
+  local s status email account_id
+  s="$(auth_summary "$home")"
+  status="$(printf '%s\n' "$s" | sed -n 's/^status=//p')"
+  email="$(printf '%s\n' "$s" | sed -n 's/^email=//p')"
+  account_id="$(printf '%s\n' "$s" | sed -n 's/^account_id=//p')"
+  printf '%s%-12s home=%s status=%s email=%s account_id=%s\n' "$marker" "$name" "$home" "$status" "$email" "$account_id"
+}
+
+list_accounts() {
+  local current
+  current="$(get_current_name)"
+
+  local names=("default")
+  local d
+  for d in "$ACCOUNT_ROOT"/.codex-*; do
+    [[ -d "$d" ]] || continue
+    local base name
+    base="$(basename "$d")"
+    name="${base#.codex-}"
+    names+=("$name")
+  done
+
+  # dedupe while preserving order
+  local seen="|"
+  local n
+  for n in "${names[@]}"; do
+    [[ "$seen" == *"|$n|"* ]] && continue
+    seen+="$n|"
+    local home marker
+    home="$(account_home "$n")"
+    marker="  "
+    [[ "$n" == "$current" ]] && marker="* "
+    print_account_line "$n" "$home" "$marker"
+  done
+}
+
+cmd_init() {
+  local name="${1:-default}"
+  shift || true
+
+  local copy_config="false"
+  if [[ "${1:-}" == "--from-current-config" ]]; then
+    copy_config="true"
+  fi
+
+  local home
+  home="$(account_home "$name")"
+  mkdir -p "$home"
+
+  if [[ "$copy_config" == "true" ]]; then
+    local current_home src dst
+    current_home="$(account_home "$(get_current_name)")"
+    src="$current_home/config.toml"
+    dst="$home/config.toml"
+    if [[ -f "$src" && ! -f "$dst" ]]; then
+      cp "$src" "$dst"
+    fi
+  fi
+
+  printf 'initialized account=%s home=%s\n' "$name" "$home"
+}
+
+cmd_current() {
+  local name home s
+  name="$(get_current_name)"
+  home="$(account_home "$name")"
+  s="$(auth_summary "$home")"
+
+  printf 'current_account=%s\n' "$name"
+  printf 'codex_home=%s\n' "$home"
+  printf '%s\n' "$s"
+}
+
+cmd_switch() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "missing account name" >&2
+    exit 2
+  fi
+
+  local home
+  home="$(account_home "$name")"
+  if [[ ! -d "$home" ]]; then
+    echo "account home does not exist: $home" >&2
+    echo "run: codex-account init $name" >&2
+    exit 2
+  fi
+
+  set_current_name "$name"
+  printf 'switched current account -> %s (home=%s)\n' "$name" "$home"
+}
+
+cmd_login() {
+  local name="${1:-$(get_current_name)}"
+  local home
+  home="$(account_home "$name")"
+  mkdir -p "$home"
+
+  echo "launching: CODEX_HOME=$home codex login"
+  CODEX_HOME="$home" codex login
+}
+
+cmd_logout() {
+  local name="${1:-$(get_current_name)}"
+  local home
+  home="$(account_home "$name")"
+
+  if [[ ! -d "$home" ]]; then
+    echo "account home does not exist: $home" >&2
+    exit 2
+  fi
+
+  echo "launching: CODEX_HOME=$home codex logout"
+  CODEX_HOME="$home" codex logout
+}
+
+cmd_run() {
+  local name="$(get_current_name)"
+  if [[ "${1:-}" == "--account" ]]; then
+    name="${2:-}"
+    shift 2
+  fi
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  local home
+  home="$(account_home "$name")"
+  mkdir -p "$home"
+
+  CODEX_HOME="$home" codex "$@"
+}
+
+cmd_exec() {
+  local name="$(get_current_name)"
+  if [[ "${1:-}" == "--account" ]]; then
+    name="${2:-}"
+    shift 2
+  fi
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  if [[ "$#" -lt 1 ]]; then
+    echo "missing codex subcommand" >&2
+    exit 2
+  fi
+
+  local home
+  home="$(account_home "$name")"
+  mkdir -p "$home"
+
+  CODEX_HOME="$home" codex "$@"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    help|-h|--help)
+      usage
+      ;;
+    init)
+      cmd_init "$@"
+      ;;
+    list)
+      list_accounts
+      ;;
+    current)
+      cmd_current
+      ;;
+    switch)
+      cmd_switch "$@"
+      ;;
+    login)
+      cmd_login "$@"
+      ;;
+    logout)
+      cmd_logout "$@"
+      ;;
+    run)
+      cmd_run "$@"
+      ;;
+    exec)
+      cmd_exec "$@"
+      ;;
+    *)
+      echo "unknown command: $cmd" >&2
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
